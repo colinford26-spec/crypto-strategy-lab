@@ -1,0 +1,78 @@
+import io
+from datetime import date, timedelta
+import numpy as np, pandas as pd, requests, plotly.graph_objects as go, streamlit as st
+
+
+# Lightweight dependency-free probabilistic model. It uses a logistic score instead of scikit-learn, so it runs on Streamlit Cloud without compiled ML packages.
+def fit_probability_model(train, feature_cols):
+    x=train[feature_cols].astype(float).replace([np.inf,-np.inf],np.nan).fillna(0.0)
+    y=train.target.astype(float)
+    means=x.mean(); scales=x.std().replace(0,1).fillna(1); z=(x-means)/scales
+    weights=np.array([1.0,0.6,0.4,0.5,0.5,0.25,0.3,0.2])[:len(feature_cols)]
+    score=(z*weights).sum(axis=1)
+    pos=score[y==1].mean() if (y==1).any() else 0.0
+    neg=score[y==0].mean() if (y==0).any() else 0.0
+    direction=1 if pos>=neg else -1
+    return means,scales,weights,direction
+
+def predict_probability(data, model, feature_cols):
+    means,scales,weights,direction=model
+    x=data[feature_cols].astype(float).replace([np.inf,-np.inf],np.nan).fillna(0.0)
+    score=((x-means)/scales*weights).sum(axis=1)*direction
+    return 1/(1+np.exp(-np.clip(score,-8,8)))
+
+
+st.set_page_config(page_title="Crypto AI Research Agent v2", page_icon="🤖", layout="wide")
+st.title("🤖 Crypto AI Research Agent v2")
+st.caption("An AI-assisted research and paper-backtesting tool using daily market data. It does not place live trades or guarantee outcomes.")
+COINS={"Bitcoin":"bitcoin","Ethereum":"ethereum","BNB":"binancecoin","XRP":"ripple","Solana":"solana","Cardano":"cardano","Dogecoin":"dogecoin","TRON":"tron","Avalanche":"avalanche-2","Chainlink":"chainlink"}
+
+@st.cache_data(ttl=900,show_spinner=False)
+def load_coin(coin_id,start,end):
+    r=requests.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart/range",params={"vs_currency":"usd","from":int(pd.Timestamp(start,tz="UTC").timestamp()),"to":int(pd.Timestamp(end,tz="UTC").timestamp())},timeout=30); r.raise_for_status(); x=r.json()
+    if not x.get("prices"): raise ValueError("CoinGecko returned no prices")
+    d=pd.DataFrame(x["prices"],columns=["ms","close"]); d["timestamp"]=pd.to_datetime(d.ms,unit="ms",utc=True).dt.floor("D"); d=d.groupby("timestamp",as_index=False).close.last(); d["open"]=d.close.shift(1).fillna(d.close); d["high"]=d[["open","close"]].max(axis=1); d["low"]=d[["open","close"]].min(axis=1); return d.dropna()
+
+def features(df):
+    d=df.copy(); ret=d.close.pct_change(); d["ret1"]=ret; d["ret7"]=d.close.pct_change(7); d["ret14"]=d.close.pct_change(14); d["sma20"]=d.close.rolling(20).mean(); d["sma50"]=d.close.rolling(50).mean(); d["sma20_gap"]=d.close/d.sma20-1; d["sma50_gap"]=d.close/d.sma50-1; delta=d.close.diff(); gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False,min_periods=14).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False,min_periods=14).mean(); d["rsi"]=100-(100/(1+gain/loss)); d.loc[(loss==0)&(gain>0),"rsi"]=100; d["volatility"]=ret.rolling(14).std(); d["volume_change"]=d.volume.pct_change() if "volume" in d else 0; d["target"]=(d.close.shift(-1)>d.close).astype(int); return d
+
+def run_agent(d,capital,fee,slip,size,threshold):
+    cols=["ret1","ret7","ret14","sma20_gap","sma50_gap","rsi","volatility","volume_change"]
+    missing=[c for c in cols if c not in d.columns]
+    if missing:
+        raise ValueError(f"Feature columns were not created: {missing}. Check that daily data loaded correctly.")
+    z=d.replace([np.inf,-np.inf],np.nan).dropna(subset=cols).copy()
+    z=z[z["target"].notna()].copy()
+    if len(z)<30:
+        raise ValueError(f"Only {len(z)} usable rows remain; at least 30 are needed. Load a longer date range."); split=max(int(len(z)*.7),1)
+    if split>=len(z): raise ValueError("Not enough data after feature calculation")
+    model=fit_probability_model(z.iloc[:split],cols); z["probability"]=np.nan; z.iloc[split:,z.columns.get_loc("probability")]=predict_probability(z.iloc[split:],model,cols); z["signal"]=np.where(z.probability>=threshold,1,np.where(z.probability<=1-threshold,-1,0)); cash=capital; qty=0.; entry=0.; trades=[]; equity=[]
+    for _,r in z.iloc[split:].iterrows():
+        price=float(r.close); action=int(r.signal)
+        if action==1 and not qty: exe=price*(1+slip/100); spend=cash*size/100; qty=spend/exe; cash-=spend*(1+fee/100); entry=exe; trades.append([r.timestamp,"BUY",exe,qty,0])
+        elif action==-1 and qty: exe=price*(1-slip/100); proceeds=qty*exe*(1-fee/100); pnl=proceeds-qty*entry; cash+=proceeds; trades.append([r.timestamp,"SELL",exe,qty,pnl]); qty=0; entry=0
+        equity.append([r.timestamp,cash+qty*price])
+    if qty: price=float(z.iloc[-1].close); proceeds=qty*price*(1-fee/100); cash+=proceeds; trades.append([z.iloc[-1].timestamp,"FINAL EXIT",price,qty,proceeds-qty*entry])
+    eq=pd.DataFrame(equity,columns=["timestamp","equity"]); tr=pd.DataFrame(trades,columns=["timestamp","side","price","quantity","pnl"]); y=z.iloc[split:].target; prob=z.iloc[split:].probability; auc=roc_auc_score(y,prob) if y.nunique()>1 else np.nan; return z,eq,tr,cash,float(((prob>=.5).astype(int)==y).mean()),auc
+
+st.sidebar.header("1. Data")
+coin=st.sidebar.selectbox("Cryptocurrency",list(COINS)); end=date.today(); start=st.sidebar.date_input("Start date",end-timedelta(days=365),min_value=end-timedelta(days=365),max_value=end); load=st.sidebar.button("Load data",type="primary")
+if load:
+    try: st.session_state.df=load_coin(COINS[coin],start,end+timedelta(days=1)); st.success("Data loaded")
+    except Exception as e: st.error(str(e))
+df=st.session_state.get("df")
+if df is None: st.info("Select a coin and click Load data."); st.stop()
+st.sidebar.header("2. Agent controls"); threshold=st.sidebar.slider("Minimum AI probability",.51,.90,.60,.01); capital=st.sidebar.number_input("Starting balance",100.,1000000.,1000.,100.); size=st.sidebar.slider("Position size (%)",1,100,100); fee=st.sidebar.number_input("Fee per side (%)",0.,5.,.1,.01); slip=st.sidebar.number_input("Slippage (%)",0.,5.,.05,.01)
+if st.sidebar.button("Run AI agent",type="primary"):
+    try: st.session_state.result=run_agent(df,capital,fee,slip,size,threshold)
+    except Exception as e: st.error(str(e))
+if "result" not in st.session_state: st.info("Set the controls and click Run AI agent."); st.stop()
+z,eq,tr,final,acc,auc=st.session_state.result; ret=(final/capital-1)*100; dd=(eq.equity/eq.equity.cummax()-1)*100
+c=st.columns(6); c[0].metric("Agent signal", "BUY" if z.signal.iloc[-1]==1 else "SELL" if z.signal.iloc[-1]==-1 else "HOLD"); c[1].metric("Latest probability",f"{z.probability.iloc[-1]*100:.1f}%" if pd.notna(z.probability.iloc[-1]) else "n/a"); c[2].metric("Final balance",f"${final:,.2f}"); c[3].metric("Return",f"{ret:.2f}%"); c[4].metric("Trades",len(tr)); c[5].metric("Test AUC",f"{auc:.3f}" if pd.notna(auc) else "n/a")
+t1,t2,t3=st.tabs(["Agent view","Backtest","Trades"])
+with t1:
+    st.subheader("Prediction probability"); pf=go.Figure(go.Scatter(x=z.timestamp,y=z.probability*100,name="Probability")); pf.add_hline(y=threshold*100,line_dash="dash",line_color="green"); pf.add_hline(y=(1-threshold)*100,line_dash="dash",line_color="red"); pf.update_yaxes(range=[0,100],title="Probability of positive next day (%)"); st.plotly_chart(pf,width="stretch"); st.write(f"Out-of-sample accuracy: {acc:.1%}. The agent trains on the first 70% and evaluates on the later 30%.")
+with t2:
+    ef=go.Figure(go.Scatter(x=eq.timestamp,y=eq.equity,name="AI equity")); ef.update_layout(height=430); st.plotly_chart(ef,width="stretch"); st.download_button("Download predictions",z.to_csv(index=False),"predictions.csv","text/csv")
+with t3:
+    st.download_button("Download trades",tr.to_csv(index=False),"trades.csv","text/csv"); st.dataframe(tr,width="stretch")
